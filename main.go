@@ -2,25 +2,71 @@ package main
 
 import (
 	"errors"
-	"time"
 	"fmt"
 	"log"
+	"sync"
 	"net"
 	"net/http"
 	"strconv"
+	"time"
+	"reflect"
+	"strings"
 )
 
-type Peer struct {
-	Ip net.IP
-	Protocol string
-	Timestamp int64
-	Port int
-	Expires int
+type PeerDatabase struct {
+	Mutex sync.RWMutex
+	Ip []net.IP
+	Timestamp []int64
+	Expires []uint8
+};
+
+func peerUrlEncode(ip net.IP, timestamp int64, expires uint8) string {
+	return fmt.Sprintf("ip=%s&timestamp=%d&expires=%d", ip.String(), timestamp, expires);
 }
 
-// Table of peers for IPV4 and IPV6 should both be keyed by only ip address.
-// Servers should create reverse proxies if they want multiple discovery ports.
-var database = []Peer{}
+func (database *PeerDatabase) ContainsKey(ip net.IP) bool {
+	database.Mutex.RLock()
+	defer database.Mutex.RUnlock()
+	for _, dataip := range database.Ip {
+		if reflect.DeepEqual(dataip, ip) {
+			log.Print("IP already in database\n")
+			return true
+		}
+	}
+	return false
+}
+
+func (database *PeerDatabase) Add(ip net.IP, timestamp int64, expires uint8) {
+	if (database.ContainsKey(ip)) {
+		return
+	}
+	database.Mutex.Lock()
+	defer database.Mutex.Unlock()
+	database.Ip = append(database.Ip, ip)
+	database.Timestamp = append(database.Timestamp, timestamp)
+	database.Expires = append(database.Expires, expires)
+}
+
+func (database *PeerDatabase) Dump(timestamp int64) string {
+	database.Mutex.RLock()
+	defer database.Mutex.RUnlock()
+	var response strings.Builder
+	for i := range database.Ip {
+		current := database.Timestamp[i]
+		if current < timestamp {
+			continue
+		}
+		response.WriteString(peerUrlEncode(
+			database.Ip[i],
+			current,
+			database.Expires[i]))
+		response.WriteString("\n")
+	}
+	return response.String()
+}
+
+var v4database = PeerDatabase{};
+var v6database = PeerDatabase{};
 
 func getRemoteIp(addr string) (net.IP, error) {
 	var ip []byte
@@ -36,89 +82,96 @@ func getRemoteIp(addr string) (net.IP, error) {
 	return ip, errors.New(fmt.Sprintf("IP of remote addr '%s' not found!", addr))
 }
 
-func handleBroadcast(w http.ResponseWriter, r *http.Request) (int, string, error) {
+func handleBroadcast(w http.ResponseWriter, r *http.Request) (int, error) {
 	err := r.ParseForm()
 	if err != nil {
-		return http.StatusBadRequest, "", err
+		return http.StatusBadRequest, err
 	}
-	ports, protocols := r.Form["port"], r.Form["protocol"]
-	if len(ports) != 1 || len(protocols) != 1 {
-		return http.StatusBadRequest,
-		"",
-		errors.New(fmt.Sprintf(
-			"Expected exactly 1 protocol and port, got %d protocols and %d ports",
-			len(protocols), len(ports)))
+
+	timestamps := r.PostForm["timestamp"]
+	var timestamp = int64(0)
+
+	if len(timestamps) != 0 {
+		parsed, err := strconv.ParseInt(timestamps[0], 10, 64)
+		if err != nil {
+			return http.StatusBadRequest, err
+		}
+		timestamp = parsed
+	} else {
+		timestamp = time.Now().Unix()
 	}
-	port, err := strconv.Atoi(ports[0])
-	if err == nil && (port <= 0 || port > 65535) {
-		err = errors.New(fmt.Sprintf(
-			"Port number overflow! ('%d' not in [1,65535])",
-			port))
-	}
-	if err != nil {
-		return http.StatusBadRequest, "", err
-	}
-	protocol := protocols[0]
-	if protocol != "dtls" && protocol != "tls" && protocol != "tcp" && protocol != "udp" {
-		return http.StatusBadRequest,
-		"",
-		errors.New(fmt.Sprintf(
-			"Expected 'dtls', 'tls', 'tcp', or 'udp' protocol, got '%s'",
-			protocol))
-	}
+
 	ip, err := getRemoteIp(r.RemoteAddr)
 	if err != nil {
-		return http.StatusInternalServerError, "", err
+		return http.StatusInternalServerError, err
 	}
-	peer := Peer{
-		Ip: ip,
-		Protocol: protocol,
-		Port: port,
-		Timestamp: time.Now().Unix(),
-		Expires: 86400,
+
+	ip4, expires := ip.To4(), uint8(60)
+	if ip4 != nil {
+		v4database.Add(ip4, timestamp, expires)
+	} else {
+		v6database.Add(ip, timestamp, expires)
 	}
-	database = append(database, peer)
-	log.Printf("Your address: %s\n", ip.String())
-	log.Printf("%d : %s\n", port, protocol)
-	log.Printf("Will save these in a database eventually...\n")
-	log.Printf("Peers:\n")
-	for _, peer := range database {
-		log.Printf("%v\n", peer)
-	}
-	return http.StatusOK, fmt.Sprintf("%s:%d", ip.String(), port), nil
+
+	fmt.Fprintf(w, peerUrlEncode(ip, timestamp, expires))
+	return http.StatusOK, nil
 }
 
-func handleQuery(w http.ResponseWriter, r *http.Request) (int, string, error) {
-	log.Print("We'll handle queries eventually here...")
-	// Filter ideas:
-	// * Filter by timestamp so only newer entries are shown
-	// * Filter to return only ipv6 or ipv4 addresses
-	// * Filter based on ip address, port, and transport layer protocol
-	response := ""
-	for _, peer := range database {
-		response += fmt.Sprintf("%v\n", peer)
+func handleQuery(w http.ResponseWriter, r *http.Request) (int, error) {
+	err := r.ParseForm()
+	if err != nil {
+		return http.StatusBadRequest, err
 	}
-	return http.StatusOK, response, nil
+
+	timestamps, preferences := r.PostForm["timestamp"], r.PostForm["prefer"]
+	var timestamp = int64(0)
+	var prefer = "4";
+
+	if len(timestamps) != 0 {
+		parsed, err := strconv.ParseInt(timestamps[0], 10, 64)
+		if err != nil {
+			return http.StatusBadRequest, err
+		}
+		timestamp = parsed
+	}
+
+	if len(preferences) != 0 {
+		prefer = preferences[0]
+	}
+	if prefer != "4" && prefer != "6" {
+		return http.StatusBadRequest,
+		errors.New(fmt.Sprintf(
+			"Expected preference of '4' or '6', got '%s'",
+			prefer))
+	}
+
+	var response = ""
+	if prefer == "4" {
+		response = v4database.Dump(timestamp) + v6database.Dump(timestamp)
+	} else {
+		response = v6database.Dump(timestamp) + v4database.Dump(timestamp)
+	}
+	log.Print(response)
+	fmt.Fprint(w, response)
+	return http.StatusOK, nil
 }
 
 func main() {
 	http.HandleFunc("/broadcast", func(w http.ResponseWriter, r *http.Request) {
-		code, response, err := handleBroadcast(w, r)
-		w.WriteHeader(code)
+		code, err := handleBroadcast(w, r)
 		if err != nil {
+			w.WriteHeader(code)
 			log.Printf("[ERROR /broadcast]: %s", err)
 			fmt.Fprint(w, err)
 		}
-		fmt.Fprintf(w, response)
 	})
 	http.HandleFunc("/query", func(w http.ResponseWriter, r *http.Request) {
-		code, response, err := handleQuery(w, r)
-		w.WriteHeader(code)
+		code, err := handleQuery(w, r)
 		if err != nil {
+			w.WriteHeader(code)
 			log.Printf("[ERROR /query]: %s", err)
 			fmt.Fprint(w, err)
 		}
-		fmt.Fprintf(w, response)
 	})
 	log.Print("Listening on :8080...")
 	log.Fatal(http.ListenAndServe(":8080", nil))
