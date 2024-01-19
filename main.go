@@ -16,13 +16,9 @@ import (
 type PeerDatabase struct {
 	Mutex sync.RWMutex
 	Ip []net.IP
-	Timestamp []int64
+	Timestamp []int32
 	Expires []uint8
 };
-
-func peerUrlEncode(ip net.IP, timestamp int64, expires uint8) string {
-	return fmt.Sprintf("ip=%s&timestamp=%d&expires=%d", ip.String(), timestamp, expires);
-}
 
 func (database *PeerDatabase) ContainsKey(ip net.IP) bool {
 	database.Mutex.RLock()
@@ -36,7 +32,7 @@ func (database *PeerDatabase) ContainsKey(ip net.IP) bool {
 	return false
 }
 
-func (database *PeerDatabase) Add(ip net.IP, timestamp int64, expires uint8) {
+func (database *PeerDatabase) Add(ip net.IP, timestamp int32, expires uint8) {
 	if (database.ContainsKey(ip)) {
 		return
 	}
@@ -47,26 +43,24 @@ func (database *PeerDatabase) Add(ip net.IP, timestamp int64, expires uint8) {
 	database.Expires = append(database.Expires, expires)
 }
 
-func (database *PeerDatabase) Dump(timestamp int64) string {
+func (database *PeerDatabase) Dump(lower int32) string {
 	database.Mutex.RLock()
 	defer database.Mutex.RUnlock()
 	var response strings.Builder
 	for i := range database.Ip {
 		current := database.Timestamp[i]
-		if current < timestamp {
+		if current < lower {
 			continue
 		}
-		response.WriteString(peerUrlEncode(
-			database.Ip[i],
-			current,
-			database.Expires[i]))
-		response.WriteString("\n")
+		response.WriteString(fmt.Sprintf("\"%s\"", database.Ip[i]))
+		response.WriteString(",")
 	}
 	return response.String()
 }
 
 var v4database = PeerDatabase{};
 var v6database = PeerDatabase{};
+var srvepoch = time.Now();
 
 func getRemoteIp(addr string) (net.IP, error) {
 	var ip []byte
@@ -88,18 +82,7 @@ func handleBroadcast(w http.ResponseWriter, r *http.Request) (int, error) {
 		return http.StatusBadRequest, err
 	}
 
-	timestamps := r.PostForm["timestamp"]
-	var timestamp = int64(0)
-
-	if len(timestamps) != 0 {
-		parsed, err := strconv.ParseInt(timestamps[0], 10, 64)
-		if err != nil {
-			return http.StatusBadRequest, err
-		}
-		timestamp = parsed
-	} else {
-		timestamp = time.Now().Unix()
-	}
+	timestamp := int32(time.Now().Sub(srvepoch) / 1_000_000_000)
 
 	ip, err := getRemoteIp(r.RemoteAddr)
 	if err != nil {
@@ -113,7 +96,8 @@ func handleBroadcast(w http.ResponseWriter, r *http.Request) (int, error) {
 		v6database.Add(ip, timestamp, expires)
 	}
 
-	fmt.Fprintf(w, peerUrlEncode(ip, timestamp, expires))
+	fmt.Fprintf(w, "{\"ip\":\"%s\",\"timestamp\":%d,\"expires\":%d}",
+		ip, timestamp, expires)
 	return http.StatusOK, nil
 }
 
@@ -123,16 +107,17 @@ func handleQuery(w http.ResponseWriter, r *http.Request) (int, error) {
 		return http.StatusBadRequest, err
 	}
 
-	timestamps, preferences := r.PostForm["timestamp"], r.PostForm["prefer"]
-	var timestamp = int64(0)
+	timestamps, preferences := r.Form["timestamp"], r.Form["prefer"]
+	now := (time.Now().Sub(srvepoch) / 1_000_000_000)
+	var timestamp = int32(0)
 	var prefer = "4";
 
 	if len(timestamps) != 0 {
-		parsed, err := strconv.ParseInt(timestamps[0], 10, 64)
+		parsed, err := strconv.ParseInt(timestamps[0], 10, 32)
 		if err != nil {
 			return http.StatusBadRequest, err
 		}
-		timestamp = parsed
+		timestamp = int32(parsed)
 	}
 
 	if len(preferences) != 0 {
@@ -146,11 +131,17 @@ func handleQuery(w http.ResponseWriter, r *http.Request) (int, error) {
 	}
 
 	var response = ""
+	var peers = ""
 	if prefer == "4" {
-		response = v4database.Dump(timestamp) + v6database.Dump(timestamp)
+		peers = v4database.Dump(timestamp) + v6database.Dump(timestamp)
 	} else {
-		response = v6database.Dump(timestamp) + v4database.Dump(timestamp)
+		peers = v6database.Dump(timestamp) + v4database.Dump(timestamp)
 	}
+	if len(peers) != 0 {
+		peers = peers[:len(peers) - 1]
+	}
+
+	response = fmt.Sprintf("{\"now\":%d,\"peers\":[%s]}", now, peers)
 	log.Print(response)
 	fmt.Fprint(w, response)
 	return http.StatusOK, nil
