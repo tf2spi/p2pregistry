@@ -59,16 +59,17 @@ func (database *PeerDatabase) Tick(delta uint8) {
 	}
 }
 
-func (database *PeerDatabase) Dump(lower int32, iplen int) string {
+func (database *PeerDatabase) Dump(lower int32, subnet net.IPNet) string {
 	database.Mutex.RLock()
 	defer database.Mutex.RUnlock()
 	var response strings.Builder
-	for ip, peertime := range database.Lookup {
+	for ipbytes, peertime := range database.Lookup {
 		current, _ := peertime.Fields()
-		if current < lower {
+		ip := net.IP(ipbytes[:len(subnet.IP)])
+		if current < lower || !subnet.Contains(ip) {
 			continue
 		}
-		response.WriteString(fmt.Sprintf("\"%s\"", net.IP(ip[:iplen]).String()))
+		response.WriteString(fmt.Sprintf("\"%s\"", ip.String()))
 		response.WriteString(",")
 	}
 	return response.String()
@@ -95,7 +96,7 @@ func getRemoteIp(addr string) (net.IP, error) {
 	return ip, errors.New(fmt.Sprintf("IP of remote addr '%s' not found!", addr))
 }
 
-func handleBroadcast(w http.ResponseWriter, r *http.Request) (int, error) {
+func handleRegister(w http.ResponseWriter, r *http.Request) (int, error) {
 	err := r.ParseForm()
 	if err != nil {
 		return http.StatusBadRequest, err
@@ -127,7 +128,10 @@ func handleQuery(w http.ResponseWriter, r *http.Request) (int, error) {
 	}
 
 	timestamps, preferences := r.Form["timestamp"], r.Form["prefer"]
+	subnets4, subnets6 := r.Form["subnet4"], r.Form["subnet6"]
 	now := (time.Now().Sub(srvEpoch) / 1_000_000_000)
+	var _, subnet4, _ = net.ParseCIDR("0.0.0.0/0")
+	var _, subnet6, _ = net.ParseCIDR("::/0")
 	var timestamp = int32(0)
 	var prefer = "4";
 
@@ -149,12 +153,41 @@ func handleQuery(w http.ResponseWriter, r *http.Request) (int, error) {
 			prefer))
 	}
 
+	if len(subnets4) != 0 {
+		_, tmp, err := net.ParseCIDR(subnets4[0])
+		if err != nil {
+			return http.StatusBadRequest, err
+		}
+		if len(tmp.IP) != 4 {
+			return http.StatusBadRequest,
+			errors.New(fmt.Sprintf(
+				"Specified IPv6 CIDR '%s' as IPv4 subnet",
+				tmp.String()))
+		}
+		subnet4 = tmp
+	}
+
+	if len(subnets6) != 0 {
+		_, tmp, err := net.ParseCIDR(subnets6[0])
+		if err != nil {
+			return http.StatusBadRequest, err
+		}
+		if len(tmp.IP) != 16 {
+			return http.StatusBadRequest,
+			errors.New(fmt.Sprintf(
+				"Specified IPv4 CIDR '%s' as IPv6 subnet",
+				tmp.String()))
+		}
+		subnet6 = tmp
+	}
+
+
 	var response = ""
 	var peers = ""
 	if prefer == "4" {
-		peers = v4Database.Dump(timestamp, 4) + v6Database.Dump(timestamp, 16)
+		peers = v4Database.Dump(timestamp, *subnet4) + v6Database.Dump(timestamp, *subnet6)
 	} else {
-		peers = v6Database.Dump(timestamp, 16) + v4Database.Dump(timestamp, 4)
+		peers = v6Database.Dump(timestamp, *subnet6) + v4Database.Dump(timestamp, *subnet4)
 	}
 	if len(peers) != 0 {
 		peers = peers[:len(peers) - 1]
@@ -179,11 +212,11 @@ func main() {
 		}
 
 	}();
-	http.HandleFunc("/broadcast", func(w http.ResponseWriter, r *http.Request) {
-		code, err := handleBroadcast(w, r)
+	http.HandleFunc("/register", func(w http.ResponseWriter, r *http.Request) {
+		code, err := handleRegister(w, r)
 		if err != nil {
 			w.WriteHeader(code)
-			log.Printf("[ERROR /broadcast]: %s", err)
+			log.Printf("[ERROR /register]: %s", err)
 			fmt.Fprint(w, err)
 		}
 	})
