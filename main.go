@@ -22,26 +22,29 @@ type PeerDatabase struct {
 	Mutex sync.RWMutex
 };
 
-func makePeerTime(timestamp int32, expires uint8) PeerTime {
-	return PeerTime(int64(timestamp) << 32 | int64(expires))
+func makePeerTime(timestamp int32, port uint16, expires uint8) PeerTime {
+	return PeerTime(int64(timestamp) << 32 | int64(port) << 16 | int64(expires))
 }
 
-func (peertime PeerTime) Fields() (int32, uint8) {
-	return int32(peertime >> 32), uint8(peertime & 0xff)
+func (peertime PeerTime) Fields() (int32, uint16, uint8) {
+	return int32(peertime >> 32), uint16((peertime >> 16) & 0xffff), uint8(peertime & 0xff)
 }
 
-func (database *PeerDatabase) Add(ip net.IP, timestamp int32, expires uint8) {
+func (database *PeerDatabase) Add(ip net.IP, timestamp int32, port uint16, expires uint8) int32 {
 	database.Mutex.Lock()
 	defer database.Mutex.Unlock()
-	var ipbytes [16]byte
-	copy(ipbytes[:], ip)
-	peertime, ok := database.Lookup[ipbytes]
+	var ipBytes [16]byte
+	var timestampNew = timestamp
+	copy(ipBytes[:], ip)
+	peertime, ok := database.Lookup[ipBytes]
 	if ok {
-		prevstamp, _ := peertime.Fields()
-		database.Lookup[ipbytes] = makePeerTime(prevstamp, expires)
-	} else {
-		database.Lookup[ipbytes] = makePeerTime(timestamp, expires)
+		prevStamp, prevPort, _ := peertime.Fields()
+		if (prevPort == port) {
+			timestampNew = prevStamp
+		}
 	}
+	database.Lookup[ipBytes] = makePeerTime(timestampNew, port, expires)
+	return timestampNew
 }
 
 func (database *PeerDatabase) Tick(delta uint8) {
@@ -49,38 +52,47 @@ func (database *PeerDatabase) Tick(delta uint8) {
 	defer database.Mutex.Unlock()
 
 	for ip, peertime := range database.Lookup {
-		timestamp, expires := peertime.Fields()
+		timestamp, port, expires := peertime.Fields()
 		if expires <= delta {
 			log.Printf("%v expired!", ip);
 			delete(database.Lookup, ip)
 		} else {
-			database.Lookup[ip] = makePeerTime(timestamp, expires - delta)
+			database.Lookup[ip] = makePeerTime(timestamp, port, expires - delta)
 		}
 	}
 }
 
-func (database *PeerDatabase) Dump(lower int32, subnet net.IPNet) string {
+func dumpIpPortPair(ip net.IP, port uint16) string {
+	if (len(ip) == 16) {
+		return fmt.Sprintf("[%s]:%d", ip.String(), port)
+	} else {
+		return fmt.Sprintf("%s:%d", ip.String(), port)
+	}
+}
+
+func (database *PeerDatabase) Dump(lower int32, portFilter uint16, subnet net.IPNet) string {
 	database.Mutex.RLock()
 	defer database.Mutex.RUnlock()
 	var response strings.Builder
-	for ipbytes, peertime := range database.Lookup {
-		current, _ := peertime.Fields()
-		ip := net.IP(ipbytes[:len(subnet.IP)])
-		if current < lower || !subnet.Contains(ip) {
+	for ipBytes, peertime := range database.Lookup {
+		current, port, _ := peertime.Fields()
+		ip := net.IP(ipBytes[:len(subnet.IP)])
+		if current < lower || !subnet.Contains(ip) || (portFilter != 0 && portFilter != port) {
 			continue
 		}
-		response.WriteString(fmt.Sprintf("\"%s\"", ip.String()))
+		response.WriteString(fmt.Sprintf("\"%s\"", dumpIpPortPair(ip, port)))
 		response.WriteString(",")
 	}
 	return response.String()
 }
 
-var v4Database = PeerDatabase{ Lookup: make(map[[16]byte]PeerTime) };
-var v6Database = PeerDatabase{ Lookup: make(map[[16]byte]PeerTime) };
-var srvEpoch = time.Now();
+var v4Database = PeerDatabase{ Lookup: make(map[[16]byte]PeerTime) }
+var v6Database = PeerDatabase{ Lookup: make(map[[16]byte]PeerTime) }
+var srvEpoch = time.Now()
 
 var expireInit = uint8(60)
-var expirePeriod = uint8(10);
+var expirePeriod = uint8(10)
+const portDefault = uint16(443)
 
 func getRemoteIp(addr string) (net.IP, error) {
 	var ip []byte
@@ -104,20 +116,32 @@ func handleRegister(w http.ResponseWriter, r *http.Request) (int, error) {
 
 	timestamp := int32(time.Now().Sub(srvEpoch) / 1_000_000_000)
 
+	var port = portDefault
+	ports := r.PostForm["port"]
+	if len(ports) != 0 {
+		parsed, err := strconv.ParseUint(ports[0], 10, 16)
+		if err != nil {
+			return http.StatusBadRequest, err
+		}
+		port = uint16(parsed)
+	}
+
 	ip, err := getRemoteIp(r.RemoteAddr)
 	if err != nil {
 		return http.StatusInternalServerError, err
 	}
 
+
 	ip4, expires := ip.To4(), expireInit
+	var timestampNew int32
 	if ip4 != nil {
-		v4Database.Add(ip4, timestamp, expires)
+		timestampNew = v4Database.Add(ip4, timestamp, port, expires)
 	} else {
-		v6Database.Add(ip, timestamp, expires)
+		timestampNew = v6Database.Add(ip, timestamp, port, expires)
 	}
 
-	fmt.Fprintf(w, "{\"ip\":\"%s\",\"timestamp\":%d,\"expires\":%d}",
-		ip, timestamp, expires)
+	fmt.Fprintf(w, "{\"peer\":\"%s\",\"timestamp\":%d,\"expires\":%d}",
+		dumpIpPortPair(ip, port), timestampNew, expires)
 	return http.StatusOK, nil
 }
 
@@ -129,11 +153,21 @@ func handleQuery(w http.ResponseWriter, r *http.Request) (int, error) {
 
 	timestamps, preferences := r.Form["timestamp"], r.Form["prefer"]
 	subnets4, subnets6 := r.Form["subnet4"], r.Form["subnet6"]
+	ports := r.Form["port"]
 	now := (time.Now().Sub(srvEpoch) / 1_000_000_000)
 	var _, subnet4, _ = net.ParseCIDR("0.0.0.0/0")
 	var _, subnet6, _ = net.ParseCIDR("::/0")
+	var port = uint16(0)
 	var timestamp = int32(0)
 	var prefer = "4";
+
+	if len(ports) != 0 {
+		parsed, err := strconv.ParseUint(ports[0], 10, 16)
+		if err != nil {
+			return http.StatusBadRequest, err
+		}
+		port = uint16(parsed)
+	}
 
 	if len(timestamps) != 0 {
 		parsed, err := strconv.ParseInt(timestamps[0], 10, 32)
@@ -185,9 +219,9 @@ func handleQuery(w http.ResponseWriter, r *http.Request) (int, error) {
 	var response = ""
 	var peers = ""
 	if prefer == "4" {
-		peers = v4Database.Dump(timestamp, *subnet4) + v6Database.Dump(timestamp, *subnet6)
+		peers = v4Database.Dump(timestamp, port, *subnet4) + v6Database.Dump(timestamp, port, *subnet6)
 	} else {
-		peers = v6Database.Dump(timestamp, *subnet6) + v4Database.Dump(timestamp, *subnet4)
+		peers = v6Database.Dump(timestamp, port, *subnet6) + v4Database.Dump(timestamp, port, *subnet4)
 	}
 	if len(peers) != 0 {
 		peers = peers[:len(peers) - 1]
